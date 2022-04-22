@@ -493,7 +493,10 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
         stakedAmounts[_periodID] = stakedAmounts[_periodID].add(_amount);
         user.amount = user.amount.add(_amount);
         user.rewardDebt = user.amount.mul(accRewardsPerGon[_periodID]).div(PRECISION_FACTOR);
-        user.lockExpiration = block.timestamp + periodLockupDurations[_periodID];
+
+        if (user.lockExpiration == 0 || user.lockExpiration < block.timestamp) {
+          user.lockExpiration = block.timestamp + periodLockupDurations[_periodID];
+        }
 
         emit Deposit(msg.sender, _amount);
     }
