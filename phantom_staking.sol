@@ -411,17 +411,13 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
 
     uint256 public rewardsEndTimestamp;
     uint256 public rewardsStartTimestamp;
-    uint256 public lastRewardTimestamp;
-    uint256 public rewardPerDay;
 
-    uint256[] public periodRewardsAllocations; // entire reward payable per day is further split into several lock periods, favoring longer lock ups over shorter ones; 100% is 1000
-    uint256[] public periodLockupDurations; // how long tokens should be locked for
+    mapping(uint256 => StakingProgram) public programs;
+    uint256 public _currentProgramID;
 
-    uint256 public PRECISION_FACTOR = 10 ** 21;
     uint256 public earlyWithdrawalTax = 250; // 1000 is 100%
 
-    mapping(uint256 => uint256) public stakedAmounts; // how much is staked per each period
-    mapping(uint256 => uint256) public accRewardsPerGon; // rewards payable per gon
+    mapping(uint256 => uint256) public stakedAmounts; // how much is staked per each program
 
     IERC20 public principleToken; //used for both staking and rewards
     address public treasury; //burnt tokens are sent over there
@@ -430,28 +426,32 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
 
     struct UserInfo {
         uint256 amount; // amount staked
-        uint256 rewardDebt; // amount paid out
+        uint256 annualPayout; // amount to be paid out annually
+        uint256 lastClaimed; // timestamp when last claimed or deposit creation time
         uint256 lockExpiration; // when deposited tokens can be paid back without penalty
+    }
+
+    struct StakingProgram {
+      uint256 annualRate; // 100000 is 100%
+      uint256 lockDuration; // lock duration in seconds. Withdrawals before lock expiration face early withdrawal tax
+      bool enabled; // whether new deposits can be made into this program
     }
 
     event Deposit(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
 
-    constructor(address _token, address _treasury, uint256 _rewardPerDay, uint256 _rewardsStartTimestamp, uint256 _rewardsEndTimestamp) public {
+    constructor(address _token, address _treasury, uint256 _rewardsStartTimestamp, uint256 _rewardsEndTimestamp) public {
         require(_rewardsEndTimestamp > _rewardsStartTimestamp);
         principleToken = IERC20(_token);
         treasury = _treasury;
-        rewardPerDay = _rewardPerDay;
         rewardsStartTimestamp = _rewardsStartTimestamp;
         rewardsEndTimestamp = _rewardsEndTimestamp;
-        lastRewardTimestamp = rewardsStartTimestamp;
     }
 
     function setupStakingTime(uint256 _startTimestamp, uint256 _endTimestamp) public onlyOwner {
         if (_startTimestamp != rewardsStartTimestamp) {
           require(block.timestamp < rewardsStartTimestamp, "Pool has started");
           require(block.timestamp < _startTimestamp, "New start timestamp must be higher than current timestamp");
-          lastRewardTimestamp = _startTimestamp;
         }
 
         require(_startTimestamp < _endTimestamp, "New start timestamp must be lower than new end timestamp");
@@ -461,72 +461,84 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
         rewardsEndTimestamp = _endTimestamp;
     }
 
-    function setupStakingRewards(uint256 _rewardPerDay, uint256 _earlyTax, uint256[] memory _allocations, uint256[] memory _durations) public onlyOwner {
-        require(_allocations.length == _durations.length, "Incorrect input");
+    function setupEarlyWithdrawalTax(uint256 _earlyTax) public onlyOwner {
         require(_earlyTax < 1000, "Cannot exceed 100%");
-        if (_allocations.length > 0) {
-          if (periodLockupDurations.length > 0) {
-            uint256 sumAllocations;
-            for (uint i = 0; i < periodLockupDurations.length; i++) {
-              require(periodLockupDurations[i] == _durations[i], "Cannot change existing period durations");
-            }
-            for (uint i = 0; i < _allocations.length; i++) {
-              sumAllocations = sumAllocations.add(_allocations[i]);
-            }
-            require(sumAllocations == 1000, "Allocations do not sum up to 100%");
-          }
-          periodRewardsAllocations = _allocations;
-          periodLockupDurations = _durations;
-        }
-        rewardPerDay = _rewardPerDay;
         earlyWithdrawalTax = _earlyTax;
     }
 
-    function deposit(uint256 _amount, uint256 _periodID) external nonReentrant {
-        require(_periodID < periodRewardsAllocations.length, "Period ID does not exist");
-        require(_amount > 0, "Must be higher than 0");
-        UserInfo storage user = userInfo[msg.sender][_periodID];
+    function addStakingPrograms(uint256[] memory _rates, uint256[] memory _durations) public onlyOwner {
+        require(_rates.length == _durations.length, "Incorrect input");
+        require(_rates.length > 0, "No programs to add");
 
-        _updatePool();
+        for (uint i = 0; i < _rates.length; i++) {
+          require(_durations[i] > 0, "Duration must be greater than 0");
+          programs[_currentProgramID] = StakingProgram({
+            annualRate: _rates[i],
+            lockDuration: _durations[i],
+            enabled: true
+          });
+          _currentProgramID++;
+        }
+    }
 
+    function toggleStakingPrograms(uint256[] memory _programIDs, bool _enabled) public onlyOwner {
+        require(_programIDs.length > 0, "No programs to toggle");
+        for (uint i = 0; i < _programIDs.length; i++) {
+          require(_programIDs[i] < _currentProgramID, "No such program ID");
+          programs[_programIDs[i]].enabled = _enabled;
+        }
+    }
+
+    function deposit(uint256 _amount, uint256 _programID) external nonReentrant {
+        require(_programID < _currentProgramID, "Program ID does not exist");
+        require(_amount > 0, "Deposit must be higher than 0");
+        require(programs[_programID].enabled, "Program does not accept any more deposits");
+
+        UserInfo storage user = userInfo[msg.sender][_programID];
         principleToken.safeTransferFrom(msg.sender, address(this), _amount);
-        stakedAmounts[_periodID] = stakedAmounts[_periodID].add(_amount);
+        stakedAmounts[_programID] = stakedAmounts[_programID].add(_amount);
+
+        if (user.lastClaimed > 0) _harvestRewards(msg.sender, _programID, true);
+
         user.amount = user.amount.add(_amount);
-        user.rewardDebt = user.amount.mul(accRewardsPerGon[_periodID]).div(PRECISION_FACTOR);
+        user.annualPayout = user.amount.mul(programs[_programID].annualRate).div(100000);
+        user.lastClaimed = block.timestamp;
 
         if (user.lockExpiration == 0 || user.lockExpiration < block.timestamp) {
-          user.lockExpiration = block.timestamp + periodLockupDurations[_periodID];
+          user.lockExpiration = block.timestamp + programs[_programID].lockDuration;
         }
 
         emit Deposit(msg.sender, _amount);
     }
 
     function harvestRewards(bool reinvest) external nonReentrant {
-        _updatePool();
 
         uint256 pending = pendingReward(msg.sender);
         require(pending > 0, "No reward to harvest");
         if (!reinvest) principleToken.safeTransfer(msg.sender, pending);
 
-        for (uint i = 0; i < periodRewardsAllocations.length; i++) {
-          UserInfo storage user = userInfo[msg.sender][i];
-          if (reinvest) {
-            uint256 _pendingRewardPeriod = pendingRewardPerPeriod(msg.sender, i);
-            user.amount = user.amount.add(_pendingRewardPeriod);
-            stakedAmounts[i] = stakedAmounts[i].add(_pendingRewardPeriod);
-          }
-          user.rewardDebt = user.amount.mul(accRewardsPerGon[i]).div(PRECISION_FACTOR);
+        for (uint i = 0; i < _currentProgramID; i++) {
+          _harvestRewards(msg.sender, i, reinvest);
         }
     }
 
-    function withdraw(uint256 _amount, uint256 _periodID, bool _withReward) external nonReentrant {
-        UserInfo storage user = userInfo[msg.sender][_periodID];
-        require(_periodID < periodRewardsAllocations.length, "Period ID does not exist");
+    function _harvestRewards(address _address, uint256 _programID, bool reinvest) internal {
+        UserInfo storage user = userInfo[_address][_programID];
+        if (reinvest) {
+          uint256 _pendingRewardProgram = pendingRewardPerProgram(_address, _programID);
+          user.amount = user.amount.add(_pendingRewardProgram);
+          user.annualPayout = user.amount.mul(programs[_programID].annualRate).div(100000);
+          stakedAmounts[_programID] = stakedAmounts[_programID].add(_pendingRewardProgram);
+        }
+        user.lastClaimed = block.timestamp;
+    }
+
+    function withdraw(uint256 _amount, uint256 _programID, bool _withReward) external nonReentrant {
+        UserInfo storage user = userInfo[msg.sender][_programID];
+        require(_programID < _currentProgramID, "Program ID does not exist");
         require(user.amount >= _amount, "Amount to withdraw too high");
 
-        _updatePool();
-
-        uint256 pending = user.amount.mul(accRewardsPerGon[_periodID]).div(PRECISION_FACTOR).sub(user.rewardDebt);
+        uint256 pending = pendingRewardPerProgram(msg.sender, _programID);
 
         user.amount = user.amount.sub(_amount);
         uint256 withdrawnAmount = _amount;
@@ -537,13 +549,14 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
           }
         }
         principleToken.safeTransfer(msg.sender, withdrawnAmount);
-        stakedAmounts[_periodID] = stakedAmounts[_periodID].sub(_amount);
+        stakedAmounts[_programID] = stakedAmounts[_programID].sub(_amount);
 
         if (pending > 0 && _withReward) {
             principleToken.safeTransfer(msg.sender, pending);
         }
 
-        user.rewardDebt = user.amount.mul(accRewardsPerGon[_periodID]).div(PRECISION_FACTOR);
+        user.lastClaimed = block.timestamp;
+        user.annualPayout = user.amount.mul(programs[_programID].annualRate).div(100000);
         emit Withdraw(msg.sender, _amount);
     }
 
@@ -552,40 +565,15 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
     }
 
     function pendingReward(address _user) public view returns (uint256 userRewardTotal_) {
-        for (uint i = 0; i < periodRewardsAllocations.length; i++) {
-          userRewardTotal_ = userRewardTotal_.add(pendingRewardPerPeriod(_user, i));
+        for (uint i = 0; i < _currentProgramID; i++) {
+          userRewardTotal_ = userRewardTotal_.add(pendingRewardPerProgram(_user, i));
         }
     }
 
-    function pendingRewardPerPeriod(address _user, uint256 _periodID) public view returns (uint256 userPeriodReward_) {
-        UserInfo memory user = userInfo[_user][_periodID];
-        userPeriodReward_ = accRewardsPerGon[_periodID];
-        if (block.timestamp > lastRewardTimestamp && stakedAmounts[_periodID] != 0) {
-          userPeriodReward_ = adjustedAccRewardPerGon(_periodID);
-        }
-        userPeriodReward_ = userPeriodReward_.mul(user.amount).div(PRECISION_FACTOR).sub(user.rewardDebt);
-    }
-
-    function _updatePool() internal {
-        if (block.timestamp <= lastRewardTimestamp) {
-            return;
-        }
-
-        for (uint i = 0; i < periodRewardsAllocations.length; i++) {
-          if (stakedAmounts[i] == 0) continue;
-          accRewardsPerGon[i] = adjustedAccRewardPerGon(i);
-        }
-
-        lastRewardTimestamp = block.timestamp;
-    }
-
-    function adjustedAccRewardPerGon(uint256 _periodID) internal view returns (uint256 adjustedAccReward_) {
-        require(_periodID < periodRewardsAllocations.length, "Period ID does not exist");
-        uint256 periodDailyReward = rewardPerDay.mul(periodRewardsAllocations[_periodID]).div(1000);
-        uint256 time = timeRewardable(lastRewardTimestamp, block.timestamp);
-        uint256 rewards = time.mul(periodDailyReward).div(1 days);
-
-        adjustedAccReward_ = accRewardsPerGon[_periodID].add(rewards.mul(PRECISION_FACTOR).div(stakedAmounts[_periodID]));
+    function pendingRewardPerProgram(address _user, uint256 _programID) public view returns (uint256 userProgramReward_) {
+        UserInfo memory user = userInfo[_user][_programID];
+        uint256 timePassed = timeRewardable(user.lastClaimed, block.timestamp);
+        userProgramReward_ = user.annualPayout.mul(timePassed).div(365 days);
     }
 
     function timeRewardable(uint256 _startTimestamp, uint256 _endTimestamp) internal view returns (uint256) {
