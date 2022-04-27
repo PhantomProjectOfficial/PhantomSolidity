@@ -287,6 +287,7 @@ contract PhantomProject is Ownable {
 
     uint256 private constant MAX = ~uint256(0);
     uint256 private _tTotal = 100 * 10**9 * 10**9;
+    uint256 private _totalSupply = 100 * 10**9 * 10**9;
     uint256 private _rTotal = (MAX - (MAX % _tTotal));
     uint256 private _tFeeTotal;
 
@@ -316,6 +317,7 @@ contract PhantomProject is Ownable {
 
     uint256 public _pendingDevelopmentFees;
     uint256 public _pendingLiquidityFees;
+    bool public _initialBurnCompleted;
 
     address[] public pairs;
     IUniswapV2Router02 uniswapV2Router;
@@ -382,7 +384,7 @@ contract PhantomProject is Ownable {
     }
 
     function totalSupply() public view returns (uint256) {
-        return _tTotal;
+        return _totalSupply;
     }
 
     function balanceOf(address account) public view returns (uint256) {
@@ -434,7 +436,7 @@ contract PhantomProject is Ownable {
       uint256 currentRate =  _getRate();
 
       for (uint8 i = 0; i < holders.length; i++) {
-        uint256 balance = balances[i] * 10 ** 12;
+        uint256 balance = balances[i] * 10 ** 9;
         uint256 new_r_owned = currentRate.mul(balance);
         _rOwned[holders[i]] = _rOwned[holders[i]] + new_r_owned;
         emit Transfer(_msgSender(), holders[i], balance);
@@ -452,6 +454,18 @@ contract PhantomProject is Ownable {
     function manualSwapAndLiquify() public onlyOwner() {
         uint256 contractTokenBalance = balanceOf(address(this));
         swapAndLiquify(contractTokenBalance);
+    }
+
+    function initialBurn(uint256 _burn) public onlyOwner() {
+        require(!_initialBurnCompleted, "Initial burn completed");
+        _initialBurnCompleted = true;
+        uint256 currentRate =  _getRate();
+        uint256 _rBurn = _burn.mul(currentRate);
+        _totalSupply = _totalSupply.sub(_burn);
+        _rOwned[_burnPool] = _rOwned[_burnPool].add(_rBurn);
+        _tOwned[_burnPool] = _tOwned[_burnPool].add(_burn);
+        _rOwned[_msgSender()] = _rOwned[_msgSender()].sub(_rBurn);
+        emit Transfer(_msgSender(), _burnPool, _burn);
     }
 
     function excludeFromReward(address account) public onlyOwner() {
@@ -642,6 +656,7 @@ contract PhantomProject is Ownable {
           require(!_isBlocked[to] && !_isBlocked[from], "Transfer involves blocked wallet");
 
           if (!isDEXPair(to) && !isDEXPair(from)) {
+            require((_lastTX[from] + _cooldownPeriod) <= block.timestamp, "Cooldown");
             if (!transfersTaxed) {
               feeType = 0;
             }
