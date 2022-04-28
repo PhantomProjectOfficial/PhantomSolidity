@@ -432,6 +432,7 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
     }
 
     struct StakingProgram {
+      uint256 programID; // unique program ID
       uint256 annualRate; // 100000 is 100%
       uint256 lockDuration; // lock duration in seconds. Withdrawals before lock expiration face early withdrawal tax
       bool enabled; // whether new deposits can be made into this program
@@ -473,6 +474,7 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
         for (uint i = 0; i < _rates.length; i++) {
           require(_durations[i] > 0, "Duration must be greater than 0");
           programs[_currentProgramID] = StakingProgram({
+            programID: _currentProgramID,
             annualRate: _rates[i],
             lockDuration: _durations[i],
             enabled: true
@@ -511,15 +513,13 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
         emit Deposit(msg.sender, _amount);
     }
 
-    function harvestRewards(bool reinvest) external nonReentrant {
+    function harvestRewards(uint256 _programID, bool reinvest) external nonReentrant {
 
-        uint256 pending = pendingReward(msg.sender);
+        uint256 pending = pendingRewardPerProgram(msg.sender, _programID);
         require(pending > 0, "No reward to harvest");
         if (!reinvest) principleToken.safeTransfer(msg.sender, pending);
 
-        for (uint i = 0; i < _currentProgramID; i++) {
-          _harvestRewards(msg.sender, i, reinvest);
-        }
+        _harvestRewards(msg.sender, _programID, reinvest);
     }
 
     function _harvestRewards(address _address, uint256 _programID, bool reinvest) internal {
