@@ -420,7 +420,6 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
     mapping(uint256 => uint256) public stakedAmounts; // how much is staked per each program
 
     IERC20 public principleToken; //used for both staking and rewards
-    address public treasury; //burnt tokens are sent over there
 
     mapping(address => mapping (uint256 => UserInfo)) public userInfo;
 
@@ -441,10 +440,9 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
     event Deposit(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
 
-    constructor(address _token, address _treasury, uint256 _rewardsStartTimestamp, uint256 _rewardsEndTimestamp) public {
+    constructor(address _token, uint256 _rewardsStartTimestamp, uint256 _rewardsEndTimestamp) public {
         require(_rewardsEndTimestamp > _rewardsStartTimestamp);
         principleToken = IERC20(_token);
-        treasury = _treasury;
         rewardsStartTimestamp = _rewardsStartTimestamp;
         rewardsEndTimestamp = _rewardsEndTimestamp;
     }
@@ -544,9 +542,6 @@ contract PhantomStaking is Ownable, ReentrancyGuard {
         uint256 withdrawnAmount = _amount;
         if (user.lockExpiration > block.timestamp) {
           withdrawnAmount = withdrawnAmount.mul(1000 - earlyWithdrawalTax).div(1000);
-          if (earlyWithdrawalTax > 0) {
-            principleToken.safeTransfer(treasury, _amount.sub(withdrawnAmount));
-          }
         }
         principleToken.safeTransfer(msg.sender, withdrawnAmount);
         stakedAmounts[_programID] = stakedAmounts[_programID].sub(_amount);
